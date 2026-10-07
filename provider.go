@@ -17,6 +17,7 @@ import (
 	"github.com/pressly/goose/v3/database"
 	"github.com/pressly/goose/v3/internal/controller"
 	"github.com/pressly/goose/v3/internal/gooseutil"
+	"github.com/pressly/goose/v3/internal/ownership"
 	"github.com/pressly/goose/v3/internal/sqlparser"
 	"go.uber.org/multierr"
 )
@@ -33,6 +34,11 @@ type Provider struct {
 
 	fsys fs.FS
 	cfg  config
+
+	// ownershipGuard is non-nil when [WithOwnershipReconciliation] is enabled. It snapshots and
+	// claims objects on UP and performs ledger-based reconciliation instead of scripted DOWN
+	// statements.
+	ownershipGuard *ownership.Guard
 
 	// migrations are ordered by version in ascending order. This list will never be empty and
 	// contains all migrations known to the provider.
@@ -102,6 +108,19 @@ func NewProvider(dialect Dialect, db *sql.DB, fsys fs.FS, opts ...ProviderOption
 	if store.Tablename() == "" {
 		return nil, errors.New("invalid store implementation: table name must not be empty")
 	}
+	if cfg.ownershipReconcile {
+		if cfg.disableVersioning {
+			return nil, errors.New("object ownership reconciliation cannot be used together with WithDisableVersioning")
+		}
+		if dialect == DialectCustom {
+			return nil, errors.New("object ownership reconciliation requires one of the built-in dialects and cannot be used with a custom store")
+		}
+		guard, err := ownership.NewGuard(string(dialect), store.Tablename())
+		if err != nil {
+			return nil, err
+		}
+		cfg.ownershipGuard = guard
+	}
 	return newProvider(db, store, fsys, cfg, registeredGoMigrations /* global */)
 }
 
@@ -148,11 +167,12 @@ func newProvider(
 		return nil, ErrNoMigrations
 	}
 	return &Provider{
-		db:         db,
-		fsys:       fsys,
-		cfg:        cfg,
-		store:      controller.NewStoreController(store),
-		migrations: migrations,
+		db:             db,
+		fsys:           fsys,
+		cfg:            cfg,
+		store:          controller.NewStoreController(store),
+		ownershipGuard: cfg.ownershipGuard,
+		migrations:     migrations,
 	}, nil
 }
 

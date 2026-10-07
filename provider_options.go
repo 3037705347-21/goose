@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/pressly/goose/v3/database"
+	"github.com/pressly/goose/v3/internal/ownership"
 	"github.com/pressly/goose/v3/lock"
 )
 
@@ -244,6 +245,33 @@ func WithIsolateDDL(b bool) ProviderOption {
 	})
 }
 
+// WithOwnershipReconciliation enables object-ownership reconciliation around migrations.
+//
+// When enabled, goose maintains an ownership ledger ([ownership.DefaultLedgerTable]) recording
+// which database objects (tables, columns and secondary indexes) each migration introduced. UP
+// migrations claim exactly the objects they created; DOWN migrations no longer execute their
+// scripted DOWN statements. Instead, goose reconciles the live catalog against the ledger and
+// drops only objects that:
+//
+//   - are recorded as belonging to the migration being rolled back, and
+//   - still exist with the same identity and creation fingerprint.
+//
+// Objects added outside goose are never recorded and therefore survive rollback. Objects that
+// were renamed or whose type no longer matches the fingerprint, and tables that still contain
+// externally added children, block the rollback (the migration version is left applied) so an
+// operator can investigate. The procedure is convergent after interruption.
+//
+// The same migration set can run against different database backends: each backend reads its own
+// system catalog and renders its own DROP DDL, while ownership follows one canonical,
+// backend-neutral model. Supported backends are "postgres", "mysql" (and compatible dialects)
+// and "sqlite3".
+func WithOwnershipReconciliation(b bool) ProviderOption {
+	return configFunc(func(c *config) error {
+		c.ownershipReconcile = b
+		return nil
+	})
+}
+
 type config struct {
 	tableName string
 	store     database.Store
@@ -266,6 +294,11 @@ type config struct {
 	allowMissing          bool
 	disableGlobalRegistry bool
 	isolateDDL            bool
+
+	// ownershipReconcile enables the object-ownership ledger and reconciled rollback. The guard
+	// is constructed in NewProvider once the dialect and table name are known.
+	ownershipReconcile bool
+	ownershipGuard     *ownership.Guard
 
 	// Only a single logger can be set, they are mutually exclusive. If neither is set, a default
 	// [Logger] will be set to maintain backward compatibility in /v3.

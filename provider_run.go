@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pressly/goose/v3/database"
+	"github.com/pressly/goose/v3/internal/ownership"
 	"github.com/pressly/goose/v3/internal/sqlparser"
 	"github.com/sethvargo/go-retry"
 	"go.uber.org/multierr"
@@ -210,34 +211,95 @@ func (p *Provider) runIndividually(
 	if err != nil {
 		return err
 	}
+	guard := p.ownershipGuard
 	if useTx && !p.cfg.isolateDDL {
+		// The pre-migration snapshot is taken on the connection before the transaction starts;
+		// the post-migration claim runs inside the transaction so on transactional-DDL backends
+		// the ledger write is atomic with the migration and the version record.
+		var before []ownership.Object
+		if guard != nil && direction {
+			before, err = guard.Snapshot(ctx, conn)
+			if err != nil {
+				return err
+			}
+		}
 		return beginTx(ctx, conn, func(tx *sql.Tx) error {
-			if err := p.runMigration(ctx, tx, m, direction); err != nil {
+			if guard != nil {
+				if direction {
+					if err := p.runMigration(ctx, tx, m, direction); err != nil {
+						return err
+					}
+					if err := guard.Claim(ctx, tx, m.Version, before); err != nil {
+						return err
+					}
+				} else {
+					// Reconciled rollback replaces the scripted DOWN statements entirely.
+					report, err := guard.ReconcileDown(ctx, tx, m.Version)
+					if err != nil {
+						return err
+					}
+					p.logOwnershipReport(ctx, report)
+				}
+			} else if err := p.runMigration(ctx, tx, m, direction); err != nil {
 				return err
 			}
 			return p.maybeInsertOrDelete(ctx, tx, m.Version, direction)
 		})
 	}
+
+	// Non-transactional path. Go migrations execute against *sql.DB (their documented contract),
+	// SQL migrations against the connection; catalog reads for the guard use the connection in
+	// both cases.
+	var execDB database.DBTxConn
 	switch m.Type {
 	case TypeGo:
-		// Note, we are using *sql.DB instead of *sql.Conn because it's the Go migration contract.
-		// This may be a deadlock scenario if max open connections is set to 1 AND a lock is
-		// acquired on the database. In this case, the migration will block forever unable to
-		// acquire a connection from the pool.
-		//
-		// For now, we guard against this scenario by checking the max open connections and
-		// returning an error in the prepareMigration function.
-		if err := p.runMigration(ctx, p.db, m, direction); err != nil {
-			return err
-		}
-		return p.maybeInsertOrDelete(ctx, p.db, m.Version, direction)
+		execDB = p.db
 	case TypeSQL:
-		if err := p.runMigration(ctx, conn, m, direction); err != nil {
+		execDB = conn
+	default:
+		return fmt.Errorf("failed to run individual migration: neither sql or go: %v", m)
+	}
+
+	var before []ownership.Object
+	if guard != nil && direction {
+		before, err = guard.Snapshot(ctx, conn)
+		if err != nil {
 			return err
 		}
-		return p.maybeInsertOrDelete(ctx, conn, m.Version, direction)
 	}
-	return fmt.Errorf("failed to run individual migration: neither sql or go: %v", m)
+	if guard != nil && !direction {
+		// Reconciled rollback replaces the scripted DOWN function/statements entirely.
+		report, err := guard.ReconcileDown(ctx, conn, m.Version)
+		if err != nil {
+			return err
+		}
+		p.logOwnershipReport(ctx, report)
+	} else if err := p.runMigration(ctx, execDB, m, direction); err != nil {
+		return err
+	}
+	if guard != nil && direction {
+		if err := guard.Claim(ctx, conn, m.Version, before); err != nil {
+			return err
+		}
+	}
+	return p.maybeInsertOrDelete(ctx, execDB, m.Version, direction)
+}
+
+// logOwnershipReport emits a structured summary of a reconciled rollback.
+func (p *Provider) logOwnershipReport(ctx context.Context, report *ownership.Report) {
+	if report == nil {
+		return
+	}
+	p.logf(ctx,
+		fmt.Sprintf("ownership reconciliation for version %d: %d dropped, %d pruned, %d drift",
+			report.Version, len(report.Dropped), len(report.Pruned), len(report.Drifts)),
+		"ownership reconciliation",
+		slog.Int64("version", report.Version),
+		slog.String("backend", report.Backend),
+		slog.Int("dropped", len(report.Dropped)),
+		slog.Int("pruned", len(report.Pruned)),
+		slog.Int("drift", len(report.Drifts)),
+	)
 }
 
 func (p *Provider) maybeInsertOrDelete(
@@ -329,6 +391,12 @@ func (p *Provider) initialize(ctx context.Context, useLocker bool) (*sql.Conn, f
 	// need the version table because no versions are being tracked.
 	if !p.cfg.disableVersioning {
 		if err := p.ensureVersionTable(ctx, conn); err != nil {
+			return nil, nil, multierr.Append(err, cleanup())
+		}
+	}
+	// The ownership ledger is bookkeeping that must exist before the first migration runs.
+	if p.ownershipGuard != nil {
+		if err := p.ownershipGuard.Ensure(ctx, conn); err != nil {
 			return nil, nil, multierr.Append(err, cleanup())
 		}
 	}
