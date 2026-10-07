@@ -39,33 +39,8 @@ var store legacystore.Store
 
 // SetDialect sets the dialect to use for the goose package.
 func SetDialect(s string) error {
-	var d Dialect
-	switch s {
-	case "postgres", "pgx":
-		d = DialectPostgres
-	case "mysql":
-		d = DialectMySQL
-	case "sqlite3", "sqlite":
-		d = DialectSQLite3
-	case "spanner":
-		d = DialectSpanner
-	case "mssql", "azuresql", "sqlserver":
-		d = DialectMSSQL
-	case "redshift":
-		d = DialectRedshift
-	case "tidb":
-		d = DialectTiDB
-	case "clickhouse":
-		d = DialectClickHouse
-	case "vertica":
-		d = DialectVertica
-	case "ydb":
-		d = DialectYdB
-	case "turso":
-		d = DialectTurso
-	case "starrocks":
-		d = DialectStarrocks
-	default:
+	d, ok := DriverDialect(s)
+	if !ok {
 		return fmt.Errorf("%q: unknown dialect", s)
 	}
 	var err error
