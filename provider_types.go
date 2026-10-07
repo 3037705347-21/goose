@@ -18,10 +18,16 @@ const (
 //
 // The Path field may be empty if the migration was registered manually. This is typically the case
 // for Go migrations registered using the [WithGoMigration] option.
+//
+// The Owner field is the name of the [MigrationSource] the migration belongs to. It is empty when
+// the provider was created with a single unnamed filesystem.
 type Source struct {
 	Type    MigrationType
 	Path    string
 	Version int64
+	// Owner is the name of the owning migration source. It may be empty for a single-filesystem
+	// provider or manually registered Go migrations.
+	Owner string
 }
 
 // MigrationResult is the result of a single migration operation.

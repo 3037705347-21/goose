@@ -125,7 +125,7 @@ func (p *Provider) runMigrations(
 	// any migrations to catch errors early and prevent leaving the database in an incomplete state.
 
 	for _, m := range apply {
-		if err := p.prepareMigration(p.fsys, m, direction.ToBool()); err != nil {
+		if err := p.prepareMigration(p.migrationFS(m), m, direction.ToBool()); err != nil {
 			return nil, fmt.Errorf("failed to prepare migration %s: %w", m.ref(), err)
 		}
 	}
@@ -150,6 +150,7 @@ func (p *Provider) runMigrations(
 				Type:    m.Type,
 				Path:    m.Source,
 				Version: m.Version,
+				Owner:   m.owner,
 			},
 			Direction: direction.String(),
 			Empty:     isEmpty(m, direction.ToBool()),
@@ -331,8 +332,58 @@ func (p *Provider) initialize(ctx context.Context, useLocker bool) (*sql.Conn, f
 		if err := p.ensureVersionTable(ctx, conn); err != nil {
 			return nil, nil, multierr.Append(err, cleanup())
 		}
+		// For multi-source providers, reconcile the sources against the applied versions in the
+		// database before any operation runs. This guards against already applied versions being
+		// silently taken over by another owner, vanishing, or changing contents.
+		if p.sourceScan != nil {
+			if err := p.reconcileAgainstDB(ctx, conn); err != nil {
+				return nil, nil, multierr.Append(err, cleanup())
+			}
+		}
 	}
 	return conn, cleanup, nil
+}
+
+// migrationFS returns the filesystem that should be used to read and parse the migration. Migrations
+// belonging to an owned source are read from that source's filesystem; all others fall back to the
+// provider filesystem.
+func (p *Provider) migrationFS(m *Migration) fs.FS {
+	if fsys, ok := p.ownerFS[m.Version]; ok {
+		return fsys
+	}
+	return p.fsys
+}
+
+// reconcileAgainstDB runs the database-aware reconciliation at most once per Provider. On success
+// the authoritative manifest is persisted atomically (if configured); on conflict the cached error
+// is returned on every subsequent operation, refusing execution.
+func (p *Provider) reconcileAgainstDB(ctx context.Context, conn *sql.Conn) error {
+	p.reconcileOnce.Do(func() {
+		dbMigrations, err := p.store.ListMigrations(ctx, conn)
+		if err != nil {
+			p.reconcileErr = fmt.Errorf("failed to list applied migrations for reconciliation: %w", err)
+			return
+		}
+		applied := make(map[int64]bool, len(dbMigrations))
+		for _, m := range dbMigrations {
+			if m.Version > 0 && m.IsApplied {
+				applied[m.Version] = true
+			}
+		}
+		manifest, conflicts := buildManifest(p.sourceScan, p.priorManifest, applied)
+		if len(conflicts) > 0 {
+			p.reconcileErr = &ReconcileError{Conflicts: conflicts}
+			return
+		}
+		if p.cfg.manifestPath != "" {
+			if err := SaveManifest(p.cfg.manifestPath, manifest); err != nil {
+				p.reconcileErr = err
+				return
+			}
+		}
+		p.manifest = manifest
+	})
+	return p.reconcileErr
 }
 
 func (p *Provider) ensureVersionTable(

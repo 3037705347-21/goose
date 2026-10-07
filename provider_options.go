@@ -244,6 +244,48 @@ func WithIsolateDDL(b bool) ProviderOption {
 	})
 }
 
+// WithMigrationSources configures the provider with multiple named migration sources, for example
+// migrations embedded in the application binary and a local deployment directory. All sources are
+// reconciled into a single authoritative list that records the owner of every version.
+//
+// The provider refuses to start when a required source is missing or when the same version is
+// provided by more than one source. Before any migration runs, the provider additionally verifies
+// that already applied versions are still provided by the same owner with unchanged contents. See
+// [ReconcileError] and the conflict kinds for details.
+//
+// When this option is used, the fsys argument of [NewProvider] must be nil. Use
+// [WithManifestPath] to persist the reconciled manifest, which is required to detect owner or
+// content changes of already applied versions across deploys.
+func WithMigrationSources(sources ...MigrationSource) ProviderOption {
+	return configFunc(func(c *config) error {
+		if len(c.sources) > 0 {
+			return errors.New("migration sources already set")
+		}
+		if err := validateMigrationSources(sources); err != nil {
+			return err
+		}
+		c.sources = append(c.sources, sources...)
+		return nil
+	})
+}
+
+// WithManifestPath sets the path of the authoritative migration manifest. The manifest is written
+// atomically after a successful reconciliation and re-read on the next provider run to detect
+// owner changes, vanished entries and content modifications of recorded versions. It can only be
+// used together with [WithMigrationSources].
+func WithManifestPath(path string) ProviderOption {
+	return configFunc(func(c *config) error {
+		if path == "" {
+			return errors.New("manifest path must not be empty")
+		}
+		if c.manifestPath != "" {
+			return fmt.Errorf("manifest path already set: %q", c.manifestPath)
+		}
+		c.manifestPath = path
+		return nil
+	})
+}
+
 type config struct {
 	tableName string
 	store     database.Store
@@ -266,6 +308,11 @@ type config struct {
 	allowMissing          bool
 	disableGlobalRegistry bool
 	isolateDDL            bool
+
+	// Multiple owned migration sources reconciled into one authoritative list. When set, fsys is
+	// ignored.
+	sources      []MigrationSource
+	manifestPath string
 
 	// Only a single logger can be set, they are mutually exclusive. If neither is set, a default
 	// [Logger] will be set to maintain backward compatibility in /v3.

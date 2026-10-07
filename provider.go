@@ -37,6 +37,19 @@ type Provider struct {
 	// migrations are ordered by version in ascending order. This list will never be empty and
 	// contains all migrations known to the provider.
 	migrations []*Migration
+
+	// Multi-source reconciliation state. These fields are only set when the provider was created
+	// with [WithMigrationSources].
+	//
+	// ownerFS maps a version to the filesystem of its owning source, so SQL migrations are parsed
+	// from the correct filesystem. scan and priorManifest drive the runtime database guard. The
+	// guard runs at most once and caches its result.
+	ownerFS       map[int64]fs.FS
+	sourceScan    *sourceScan
+	priorManifest *Manifest
+	manifest      *Manifest
+	reconcileOnce sync.Once
+	reconcileErr  error
 }
 
 // NewProvider returns a new goose provider.
@@ -59,9 +72,6 @@ func NewProvider(dialect Dialect, db *sql.DB, fsys fs.FS, opts ...ProviderOption
 	if db == nil {
 		return nil, errors.New("db must not be nil")
 	}
-	if fsys == nil {
-		fsys = noopFS{}
-	}
 	cfg := config{
 		registered:      make(map[int64]*Migration),
 		excludePaths:    make(map[string]bool),
@@ -71,6 +81,15 @@ func NewProvider(dialect Dialect, db *sql.DB, fsys fs.FS, opts ...ProviderOption
 		if err := opt.apply(&cfg); err != nil {
 			return nil, err
 		}
+	}
+	if len(cfg.sources) > 0 && fsys != nil {
+		return nil, errors.New("fsys must be nil when using WithMigrationSources; named sources provide their own filesystems")
+	}
+	if len(cfg.sources) == 0 && cfg.manifestPath != "" {
+		return nil, errors.New("WithManifestPath requires WithMigrationSources")
+	}
+	if fsys == nil {
+		fsys = noopFS{}
 	}
 	// Allow users to specify a custom store implementation, but only if they don't specify a
 	// dialect. If they specify a dialect, we'll use the default store implementation.
@@ -119,9 +138,51 @@ func newProvider(
 	// feat(mf): we could add a flag to parse SQL migrations eagerly. This would allow us to return
 	// an error if there are any SQL parsing errors. This adds a bit overhead to startup though, so
 	// we should make it optional.
-	filesystemSources, err := collectFilesystemSources(fsys, false, cfg.excludePaths, cfg.excludeVersions)
-	if err != nil {
-		return nil, err
+
+	// When multiple owned sources are configured, reconcile them first and build the migration
+	// list (and per-version owner information) from the scan result.
+	var (
+		filesystemSources *fileSources
+		ownerFS           map[int64]fs.FS
+		scan              *sourceScan
+		priorManifest     *Manifest
+	)
+	if len(cfg.sources) > 0 {
+		var err error
+		scan, err = scanMigrationSources(cfg.sources)
+		if err != nil {
+			return nil, err
+		}
+		if len(scan.conflicts) > 0 {
+			return nil, &ReconcileError{Conflicts: scan.conflicts}
+		}
+		if cfg.manifestPath != "" {
+			priorManifest, err = LoadManifest(cfg.manifestPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+		filesystemSources = &fileSources{}
+		ownerFS = make(map[int64]fs.FS, len(scan.files))
+		for _, f := range scan.files {
+			ownerFS[f.source.Version] = scan.sourceFS[f.owner]
+			switch f.source.Type {
+			case TypeSQL:
+				filesystemSources.sqlSources = append(filesystemSources.sqlSources, f.source)
+			case TypeGo:
+				filesystemSources.goSources = append(filesystemSources.goSources, f.source)
+			}
+		}
+		// merge returns SQL-only lists as-is (relying on glob order), so sort by version here to
+		// preserve the ascending-version invariant across sources.
+		sortSourcesByVersion(filesystemSources.sqlSources)
+		sortSourcesByVersion(filesystemSources.goSources)
+	} else {
+		var err error
+		filesystemSources, err = collectFilesystemSources(fsys, false, cfg.excludePaths, cfg.excludeVersions)
+		if err != nil {
+			return nil, err
+		}
 	}
 	versionToGoMigration := make(map[int64]*Migration)
 	// Add user-registered Go migrations from the provider.
@@ -147,12 +208,27 @@ func newProvider(
 	if len(migrations) == 0 {
 		return nil, ErrNoMigrations
 	}
+	if len(cfg.sources) > 0 {
+		// Attribute every migration to the owner recorded by the scan.
+		ownerByVersion := make(map[int64]string, len(scan.files))
+		for _, f := range scan.files {
+			ownerByVersion[f.source.Version] = f.owner
+		}
+		for _, m := range migrations {
+			if name, ok := ownerByVersion[m.Version]; ok {
+				m.owner = name
+			}
+		}
+	}
 	return &Provider{
-		db:         db,
-		fsys:       fsys,
-		cfg:        cfg,
-		store:      controller.NewStoreController(store),
-		migrations: migrations,
+		db:            db,
+		fsys:          fsys,
+		cfg:           cfg,
+		store:         controller.NewStoreController(store),
+		migrations:    migrations,
+		ownerFS:       ownerFS,
+		sourceScan:    scan,
+		priorManifest: priorManifest,
 	}, nil
 }
 
@@ -199,9 +275,17 @@ func (p *Provider) ListSources() []*Source {
 			Type:    m.Type,
 			Path:    m.Source,
 			Version: m.Version,
+			Owner:   m.owner,
 		})
 	}
 	return sources
+}
+
+// ReconciledManifest returns the authoritative manifest produced by the most recent database
+// reconciliation, or nil if the provider was not created with [WithMigrationSources] or has not
+// yet performed any database operation. The returned manifest must not be modified.
+func (p *Provider) ReconciledManifest() *Manifest {
+	return p.manifest
 }
 
 // Ping attempts to ping the database to verify a connection is available.
@@ -622,6 +706,7 @@ func (p *Provider) status(ctx context.Context) (_ []*MigrationStatus, retErr err
 				Type:    m.Type,
 				Path:    m.Source,
 				Version: m.Version,
+				Owner:   m.owner,
 			},
 			State: StatePending,
 		}

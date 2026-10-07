@@ -116,6 +116,10 @@ type Migration struct {
 	goUp, goDown *GoFunc
 
 	sql sqlMigration
+
+	// owner is the name of the owning MigrationSource for multi-source providers. It is empty for
+	// single-filesystem providers and manually registered Go migrations without a source file.
+	owner string
 }
 
 type sqlMigration struct {

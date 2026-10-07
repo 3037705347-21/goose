@@ -100,6 +100,13 @@ func collectFilesystemSources(
 	return sources, nil
 }
 
+// sortSourcesByVersion sorts the sources in place by ascending version.
+func sortSourcesByVersion(sources []Source) {
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i].Version < sources[j].Version
+	})
+}
+
 func newSQLMigration(source Source) *Migration {
 	return &Migration{
 		Type:      source.Type,
