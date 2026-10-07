@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pressly/goose/v3/lock/internal/reconcile"
 	"github.com/pressly/goose/v3/lock/internal/store"
 	"github.com/pressly/goose/v3/lock/internal/table"
 	"github.com/sethvargo/go-retry"
@@ -33,6 +34,7 @@ import (
 func NewPostgresTableLocker(options ...TableLockerOption) (Locker, error) {
 	config := table.Config{
 		TableName:         DefaultLockTableName,
+		LedgerTableName:   DefaultLockLedgerTableName,
 		LockID:            DefaultLockID,
 		LeaseDuration:     30 * time.Second,
 		HeartbeatInterval: 5 * time.Second,
@@ -50,11 +52,44 @@ func NewPostgresTableLocker(options ...TableLockerOption) (Locker, error) {
 			return nil, err
 		}
 	}
-	lockStore, err := store.NewPostgres(config.TableName)
+	lockStore, err := store.NewPostgres(config.TableName, config.LedgerTableName)
 	if err != nil {
 		return nil, fmt.Errorf("create lock store: %w", err)
 	}
 	return table.New(lockStore, config), nil
+}
+
+// NewPostgresTableLockReconciler returns a Reconciler that adjudicates PostgreSQL table locks.
+// It evaluates actively locked rows using the database server clock, takes over locks whose leases
+// have unambiguously expired, writes a takeover row to the ledger for each one, and leaves healthy
+// locks untouched. If any in-scope lock is ambiguous the whole run aborts (ErrAmbiguousLockState).
+//
+// Defaults:
+//
+//	Lock table: "goose_lock"
+//	Ledger table: "goose_lock_ledger"
+//	Scope: all actively locked rows
+//	Takeover lease: 30s
+//	Expiry grace: 0s
+//
+// Use [WithReconcileLockIDs] to scope the run and [WithReconcileInstanceID] together with
+// [WithInstanceID] so a locker adopts the taken-over locks.
+func NewPostgresTableLockReconciler(options ...ReconcilerOption) (Reconciler, error) {
+	config := reconcile.Config{
+		LockTableName:   DefaultLockTableName,
+		LedgerTableName: DefaultLockLedgerTableName,
+		LeaseDuration:   30 * time.Second,
+	}
+	for _, opt := range options {
+		if err := opt.applyReconciler(&config); err != nil {
+			return nil, err
+		}
+	}
+	lockStore, err := store.NewPostgres(config.LockTableName, config.LedgerTableName)
+	if err != nil {
+		return nil, fmt.Errorf("create lock store: %w", err)
+	}
+	return reconcile.New(lockStore, config), nil
 }
 
 // NewPostgresSessionLocker returns a SessionLocker that utilizes PostgreSQL's exclusive

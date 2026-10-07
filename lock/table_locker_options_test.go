@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -41,6 +42,24 @@ func TestTableLockerOptions(t *testing.T) {
 	// Test invalid unlock timeout failure threshold
 	_, err = NewPostgresTableLocker(WithTableUnlockTimeout(5*time.Second, 0))
 	require.Error(t, err)
+	// Test empty ledger table name
+	_, err = NewPostgresTableLocker(WithLedgerTableName(""))
+	require.Error(t, err)
+	// Test empty instance ID
+	_, err = NewPostgresTableLocker(WithInstanceID(""))
+	require.Error(t, err)
+	// Test nil lock lost handler
+	_, err = NewPostgresTableLocker(WithLockLostHandler(nil))
+	require.Error(t, err)
+	// Test valid new options
+	handler := func(context.Context, LockLostInfo) {}
+	locker, err = NewPostgresTableLocker(
+		WithLedgerTableName("custom_ledger"),
+		WithInstanceID("pinned-instance"),
+		WithLockLostHandler(handler),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, locker)
 }
 
 func TestMySQLTableLockerOptions(t *testing.T) {
@@ -77,4 +96,51 @@ func TestMySQLTableLockerOptions(t *testing.T) {
 	// Test invalid unlock timeout failure threshold
 	_, err = NewMySQLTableLocker(WithTableUnlockTimeout(5*time.Second, 0))
 	require.Error(t, err)
+	// Test empty ledger table name
+	_, err = NewMySQLTableLocker(WithLedgerTableName(""))
+	require.Error(t, err)
+	// Test empty instance ID
+	_, err = NewMySQLTableLocker(WithInstanceID(""))
+	require.Error(t, err)
+	// Test nil lock lost handler
+	_, err = NewMySQLTableLocker(WithLockLostHandler(nil))
+	require.Error(t, err)
+}
+
+func TestReconcilerOptions(t *testing.T) {
+	r, err := NewPostgresTableLockReconciler(
+		WithReconcileTableName("custom_locks"),
+		WithReconcileLedgerTableName("custom_ledger"),
+		WithReconcileLockIDs(1, 2, 3),
+		WithReconcileInstanceID("pinned-reconciler"),
+		WithReconcileLeaseDuration(10*time.Second),
+		WithReconcileExpiryGrace(2*time.Second),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	require.Equal(t, "pinned-reconciler", r.InstanceID())
+
+	mr, err := NewMySQLTableLockReconciler(
+		WithReconcileInstanceID("mysql-reconciler"),
+	)
+	require.NoError(t, err)
+	require.Equal(t, "mysql-reconciler", mr.InstanceID())
+
+	// A generated instance ID is used when none is pinned.
+	generated, err := NewPostgresTableLockReconciler()
+	require.NoError(t, err)
+	require.NotEmpty(t, generated.InstanceID())
+
+	// Invalid options.
+	for _, opt := range []ReconcilerOption{
+		WithReconcileTableName(""),
+		WithReconcileLedgerTableName(""),
+		WithReconcileLockIDs(0),
+		WithReconcileInstanceID(""),
+		WithReconcileLeaseDuration(-1 * time.Second),
+		WithReconcileExpiryGrace(-1 * time.Second),
+	} {
+		_, err := NewPostgresTableLockReconciler(opt)
+		require.Error(t, err)
+	}
 }

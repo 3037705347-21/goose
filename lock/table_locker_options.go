@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +27,45 @@ func WithTableName(tableName string) TableLockerOption {
 			return errors.New("lock table name must not be empty")
 		}
 		c.TableName = tableName
+		return nil
+	})
+}
+
+// WithLedgerTableName sets the name of the append-only ledger table in which lock takeovers and
+// denied renewals are recorded.
+func WithLedgerTableName(tableName string) TableLockerOption {
+	return tableLockerConfigFunc(func(c *table.Config) error {
+		if tableName == "" {
+			return errors.New("ledger table name must not be empty")
+		}
+		c.LedgerTableName = tableName
+		return nil
+	})
+}
+
+// WithInstanceID pins the locker's instance identity. By default a unique identity is generated.
+// Pin the same identity used by a reconciler so that the locker adopts locks the reconciler took
+// over without starting a new fencing generation.
+func WithInstanceID(instanceID string) TableLockerOption {
+	return tableLockerConfigFunc(func(c *table.Config) error {
+		if instanceID == "" {
+			return errors.New("instance ID must not be empty")
+		}
+		c.InstanceID = instanceID
+		return nil
+	})
+}
+
+// WithLockLostHandler sets a handler invoked once when a heartbeat is rejected because a newer
+// generation took over the lock (fencing). The handler runs on the heartbeat goroutine and must
+// return quickly; use it to cancel the work performed under the lock (for example by cancelling a
+// context) to prevent split-brain writes.
+func WithLockLostHandler(handler func(context.Context, LockLostInfo)) TableLockerOption {
+	return tableLockerConfigFunc(func(c *table.Config) error {
+		if handler == nil {
+			return errors.New("lock lost handler must not be nil")
+		}
+		c.LockLostHandler = handler
 		return nil
 	})
 }
