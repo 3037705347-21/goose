@@ -20,6 +20,7 @@ require (
 	github.com/ydb-platform/ydb-go-sdk/v3 v3.151.1
 	github.com/ziutek/mymysql v1.5.4
 	go.uber.org/multierr v1.11.0
+	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sync v0.22.0
 	modernc.org/sqlite v1.57.0
 )
@@ -77,7 +78,6 @@ require (
 	go.opentelemetry.io/otel v1.46.0 // indirect
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260824195058-e88cd73687aa // indirect
 	golang.org/x/net v0.58.0 // indirect

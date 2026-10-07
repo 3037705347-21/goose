@@ -188,6 +188,12 @@ func main() {
 		ctx, cancel = context.WithTimeout(ctx, *timeout)
 		defer cancel()
 	}
+	if command == "reconcile" {
+		if err := gooseReconcile(ctx, driver, db, arguments); err != nil {
+			log.Fatalf("goose reconcile: %v", err)
+		}
+		return
+	}
 	if err := goose.RunWithOptionsContext(
 		ctx,
 		command,
@@ -324,6 +330,8 @@ Commands:
     env                  Print the current Goose environment configuration
     fix                  Apply sequential ordering to migrations
     validate             Check migration files without running them
+    reconcile -f FILE    Reconcile app-owned version tables against a registry, report
+                         conflicts/drift/unregistered tables, converge apps in dependency order
 `
 )
 
